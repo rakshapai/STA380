@@ -1,0 +1,397 @@
+---
+title: 'Assignment 2 : Kyle Katzen, Raksha Pai, Jake Schmidt, Bhavana Vijay'
+output:
+  md_document: default
+---
+
+# Flights at ABIA: Overachieving planes
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  comment = '',
+  # fig.width = 5,
+  # fig.height = 5,
+  fig.align = 'center',
+  warning = FALSE,
+  tidy = TRUE
+  )
+```
+
+
+```{r, message=F, echo=F}
+# Prepping data. Joining lat/lng info for flight origin and destination in case we want it later.
+library(tidyverse)
+theme_set(theme_minimal())
+codes <- read_csv(url("https://opendata.socrata.com/api/views/rxrh-4cxm/rows.csv?accessType=DOWNLOAD")) %>%
+  mutate_if(is.character, factor)
+dat <- read_csv(url("https://raw.githubusercontent.com/jgscott/STA380/master/data/ABIA.csv"))[,-1] %>%
+  mutate_if(is.character, factor) %>% filter(TailNum!="") %>%
+  left_join(codes,by=c("Origin"="locationID")) %>% 
+  left_join(codes,by=c("Dest"="locationID"), suffix=c("_org","_dest")) %>% 
+  mutate(FlightNum=as.factor(FlightNum), Month=as.factor(Month), DayofMonth=as.factor(DayofMonth), DayOfWeek=as.factor(DayOfWeek), Origin=as.factor(Origin), Dest=as.factor(Dest), Cancelled=as.factor(Cancelled), Diverted=as.factor(Diverted), vel=60*Distance/AirTime)
+```
+It makes sense that the departure and arrival delays of a flight are correlated, since a plane that takes off late is behind schedule and will typically land late. But are there certain planes that can make up that gap?
+
+Let's see if any planes have significantly different average departure and arrival delays. We'll also calculate some summary stats in case we need them later.
+
+```{r}
+planes <- dat %>% group_by(TailNum) %>% summarise(
+  # two-sample Student's t-test for difference in means of departure delay and arrival delay
+  pval=ifelse(length(DepDelay)>2&length(ArrDelay)>2,t.test(DepDelay,ArrDelay)$p.value, NA),
+  avg_dep_delay=mean(DepDelay),
+  avg_arr_delay=mean(ArrDelay),
+  cancelled_ratio=sum(Cancelled==1)/n(),
+  diverted_ratio=sum(Diverted==1)/n(),
+  n_flights=n(),
+  avg_dist=mean(Distance),
+  avg_vel=mean(vel),
+  std_vel=sd(vel),
+  n_uniq_orig=n_distinct(Origin),
+  n_uniq_dest=n_distinct(Dest),
+  n_uniq_flights=n_distinct(combine(Origin,Dest)),
+# select significant planes at p=0.05 level
+) %>% filter(pval<=.05&!is.na(pval))
+# separate significantly slow planes from fast ones
+fast_planes <- planes %>% filter(avg_dep_delay>avg_arr_delay)
+slow_planes <- planes %>% filter(avg_dep_delay<avg_arr_delay)
+nrow(fast_planes)
+nrow(slow_planes)
+fast_planes %>% select(avg_dep_delay,avg_arr_delay) %>% gather(key="type", value="delay") %>% ggplot(aes(delay, fill=type))+geom_density(alpha=.7, kernel='gaussian')
+```
+
+So there are 96 "fast" planes that make up time on average and 1 "slow" plane that loses time on average. Do the fast planes have anything in common?
+```{r}
+fast_planes %>% ggplot(aes(avg_vel, avg_dep_delay-avg_arr_delay, color=avg_dist, weight=n_flights, size=n_flights))+geom_point()+geom_smooth(method='lm',formula=y~x,show.legend = F)
+```
+
+We see that, of our fast planes, the ones that make up the most time tend to fly faster, further, and less frequently. Maybe this matches the profile of large jumbo jets ferrying people to and from the coasts (Austin is about ~1700 miles from either coastline, which is the maximum average flight distance of these uber-fast fast planes)?
+
+Let's see where the fast planes' tardiness comes from:
+```{r}
+# plot the components of a plane's delay, sorted by number of flights
+fast_planes %>% left_join(dat, by="TailNum") %>% select(CarrierDelay, WeatherDelay, NASDelay, SecurityDelay, LateAircraftDelay, TailNum, n_flights) %>% na.omit() %>% gather(-TailNum:-n_flights, key="type", value="delay") %>% ggplot(aes(reorder(TailNum,n_flights), delay, fill=type))+geom_col(position="fill")+coord_flip()
+```
+
+The few planes with weather delays stand out, otherwise it's tough to say there's any one type of delay that factors in to the planes' performance. Let's see who operates these fast planes:
+```{r}
+fast_flights <- dat %>% filter(TailNum%in%fast_planes$TailNum)
+fast_flights %>% group_by(UniqueCarrier) %>% summarise(n=n_distinct(TailNum)) %>% left_join(dat %>% group_by(UniqueCarrier) %>% summarise(n=n_distinct(TailNum)), by="UniqueCarrier") %>% mutate(ratio=n.x/n.y)
+```
+
+Interesting — Southwest Airlines owns over 73/96=76% of the fast planes, and they comprise 13% of its fleet! Let's see which routes all the fast planes have flown:
+```{r}
+library(ggmap)
+fast_route_summ <- fast_flights %>% group_by(Latitude_org, Longitude_org, Latitude_dest, Longitude_dest) %>% summarise(n_flights=n(), avg_del_change=mean(DepDelay-ArrDelay)) %>%
+  ungroup() %>% mutate(route=row_number())
+# ffu <- fast_flights %>% distinct(Latitude_org, Longitude_org, Latitude_dest, Longitude_dest) %>% left_join(fast_route_summ)
+ffu <- fast_route_summ %>% select(-Latitude_dest:-Longitude_dest) %>% rename(lat=Latitude_org,lng=Longitude_org) %>% bind_rows(rename(select(fast_route_summ,-Latitude_org:-Longitude_org),lat=Latitude_dest,lng=Longitude_dest))
+
+ggmap(get_map(location = c(left = -124.848974, bottom = 24.396308,right = -66.885444, top = 49.384358))) + 
+  geom_point(data = ffu, aes(x = -lng, y = lat, size=n_flights, color=avg_del_change, fill=avg_del_change)) + 
+  geom_line(data = ffu, aes(x = -lng, y = lat, group = route, color=avg_del_change))
+```
+
+Note that `avg_del_change` = `avg_dep_del-avg_arr_del`. This map looks right for flights 76% of which are Southwest. It also corroborates our hypothesis that the longer flights are less frequent but seem also to make up their delays better.
+
+
+Let's see how are arrival and departure delays distributed across carriers? 
+```{r}
+dat %>% select(UniqueCarrier, ArrDelay, DepDelay) %>% gather(-UniqueCarrier, key="delay_type", value="minutes") %>% ggplot(aes(UniqueCarrier, minutes, fill=delay_type)) + geom_boxplot() + scale_y_log10()
+```
+From the above graph we see that YV, B6, OH have the greatest delays. 
+
+
+Seasonal delays are heavily influenced by the weather conditions. So it would be great to look at weather delays by month to understand which months to avoid traveling 
+```{r}
+dat %>% filter(!is.na(WeatherDelay)) %>% group_by(Month) %>% summarise(avg_weather_del=mean(WeatherDelay), std=sd(WeatherDelay))%>% mutate(Month=month.abb[Month]) %>% ggplot(aes(Month, avg_weather_del))+geom_col()+geom_errorbar(aes(ymin=0, ymax=avg_weather_del+std), width=.1)
+```
+
+March seems to be the worst to make air travel plans. Is it because of the destinations? Let's see
+
+
+```{r}
+d <- dat %>% filter(!is.na(WeatherDelay)) %>% group_by(Dest, Month) %>% summarise(avg_weather_del=mean(WeatherDelay)) %>% group_by(Dest) %>% filter(avg_weather_del==max(avg_weather_del)&max(avg_weather_del)!=0) %>% left_join(codes,by=c("Dest"="locationID")) %>% mutate(Month=month.abb[Month])
+
+ggmap(get_map(location = c(left = -124.848974, bottom = 24.396308,right = -66.885444, top = 49.384358))) + 
+  geom_point(data = d, aes(x = -Longitude, y = Latitude, color=Month, size=avg_weather_del))
+```
+
+Looks like Iowa is a bad destination in terms of seasonal delays in the month of march. Must be something to do with the bad weather there in march. 
+
+
+## Problem 2 : Author Prediction
+
+```{r}
+suppressMessages(library(tm)) 
+suppressMessages(library(caret))
+suppressMessages(library(glmnet))
+suppressMessages(library(SnowballC))
+suppressMessages(library(e1071))
+suppressMessages(library(Rgraphviz))
+suppressMessages(library(wordcloud))
+suppressMessages(library(RTextTools))
+suppressMessages(library(ggplot2))
+suppressMessages(library(dplyr))
+
+```
+
+
+#### Creating the corpus - 
+We preprocess the data to remove numbers, remove stopwords, make everything lowercase, remove punctuation and remove extra white spaces. 
+We are going to create the document term matrix for both the train and test together to avoid the possibility of seeing some terms that are there in the test but not in training and vice versa.
+
+
+```{r}
+readerPlain = function(fname){
+  readPlain(elem=list(content=readLines(fname)), 
+            id=fname, language='en') }
+
+authors_train <- Sys.glob('/Users/rakshapai/Downloads/STA380-master/data/ReutersC50/C50train/*')
+file_list_train = NULL
+labels_train = NULL
+authors_test = Sys.glob('/Users/rakshapai/Downloads/STA380-master/data/ReutersC50/C50test/*')
+file_list_test = NULL
+labels_test = NULL
+
+for(i in authors_train) { 
+  author_name_train = substring(i, first = 67)
+  files_to_add_train = Sys.glob(paste0(i, '/*.txt'))
+  file_list_train = append(file_list_train, files_to_add_train)
+  labels_train = append(labels_train, rep(author_name_train, length(files_to_add_train)))
+}
+
+for(i in authors_test) { 
+  author_name_test = substring(i, first = 66)
+  files_to_add_test = Sys.glob(paste0(i, '/*.txt'))
+  file_list_test = append(file_list_test, files_to_add_test)
+  labels_test = append(labels_test, rep(author_name_test, length(files_to_add_test)))
+}
+
+file_list <- append(file_list_train,file_list_test)
+labels <- unique(append(labels_train,labels_test))
+
+all_docs = lapply(file_list, readerPlain) 
+names(all_docs) = file_list
+names(all_docs) = sub('.txt', '', names(all_docs))
+all_corpus = Corpus(VectorSource(all_docs))
+#names(all_corpus) = labels
+
+all_corpus = tm_map(all_corpus, content_transformer(tolower)) # make everything lowercase
+all_corpus = tm_map(all_corpus, content_transformer(removeNumbers)) # remove numbers
+all_corpus = tm_map(all_corpus, content_transformer(removePunctuation)) # remove punctuation
+all_corpus = tm_map(all_corpus, content_transformer(stripWhitespace)) ## remove excess white-space 
+all_corpus = tm_map(all_corpus, content_transformer(removeWords), stopwords("SMART"))  #remove stop words
+all_corpus <- tm_map(all_corpus, stemDocument)    #stemming the document to reduce the words to their word stem
+
+#creating a document term matrix with tf idf scores 
+dtm <- DocumentTermMatrix(all_corpus,control = list(weighting = function(x) weightTfIdf(x, normalize = FALSE)))
+dtm <- removeSparseTerms(dtm, 0.975) 
+
+```
+
+#### Plotting word frequencies
+```{r}
+#without the weights, just the frequency counts
+dtm1 <- DocumentTermMatrix(all_corpus)
+freq <- sort(colSums(as.matrix(dtm1)), decreasing=TRUE)
+wf <- data.frame(word=names(freq), freq=freq)
+
+
+##subset(wf, freq>5000) %>%
+##ggplot(aes(word, frequency)) +
+##geom_bar(stat="identity",col="red") +
+##theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+```{r}
+set.seed(142)
+wordcloud(names(freq), freq, min.freq=2000, colors=brewer.pal(6, "Dark2"))
+```
+
+
+Here we can see how the words appear across the documents. Are some of the words are misspelt or is this the way the author has described them? Some of these questions are fundamental in pre-processing.  
+
+#### Model 1 | Multinomial Naive-Bayes
+
+Let now apply multinomial bayes model to the training data set.
+We calculate the weight vector for each author - the weight vector is a weight of each token or word for that author.In order to avoid zero probabilities for those words that could be in the test set but not in training set, we use Lidstone smoothing - where the words that are not in the vocabulary are given a small non-zero probability for the classes so that the posterior probabilities don't suddenly drop to zero.
+
+
+```{r}
+x <- as.matrix(dtm)
+x_train <- x[1:2500,]
+x_test <- x[2501:5000,]
+smooth_count = 1/nrow(x_train)   
+
+author_sums <- rowsum(x_train +smooth_count, labels_train)  
+wt <- rowSums(author_sums)
+author_wt <- log(author_sums/wt)    #  Prob of that word occuring with that author and taking a log of that
+```
+
+
+The intuition behind the supervised algorithm is that, 
+
+The probability of a document $d$ being in class $c$ is computed as : 
+
+$$Prob(c/d) = Prob(c)  \sum_{k=1}^n Prob(t_k/c) $$
+
+where $Prob(t_k/c)$ is the conditional probability of term $t_k$ occurring in a document of class c
+
+Now, we use the x_test to multiply the log probabilities calculated from the weights of the training set authors
+```{r}
+predicted_probabilities <- x_test%*%t(author_wt)     
+```
+
+In text classification, our goal is to find the best class for the document 
+
+
+Now, into a new list predicted_authors we assign for each of the 2500 test points, the author that has the max sum of probabilities.
+
+```{r}
+predicted_authors = NULL
+for( i in 1:2500) { 
+  predicted_authors = c(predicted_authors,which.max(predicted_probabilities[i,]))
+  }
+
+predicted_authors <- as.data.frame(predicted_authors)
+predicted_authors$actual <- rep(1:50,each = 50)
+```
+
+
+Now that we have predicted the authors, let's see the confusion matrix to see how we have performed. 
+
+
+```{r}
+confusionMatrix(predicted_authors$predicted_authors, predicted_authors$actual)
+```
+
+
+The naive bayes model is giving an accuracy of 50.92% on test set. Could be better. 
+
+#### Model 2 | Multinomial Logistic
+
+Let's look at the multinomial logistic regression model
+
+```{r}
+
+pc_x <- prcomp(x)
+#The first 400 components explains 78% of variance
+
+transformed_x <- pc_x$x[,1:400]
+train_transformed <- transformed_x[1:2500,]
+test_transformed <- transformed_x[2501:5000,]
+logit_model <- glmnet(y = rep(1:50, each = 50),x = train_transformed,  family = "multinomial", alpha = 0)
+predicted_authors_logit <- as.data.frame(predict(logit_model, newx = test_transformed,type = "class", s=0))
+predicted_authors_logit$actual_authors <- rep(1:50, each = 50)
+colnames(predicted_authors_logit) = c("predicted_authors","actual_authors")
+
+confusionMatrix(predicted_authors_logit$predicted_authors,predicted_authors_logit$actual_authors)
+```
+
+An accuracy of 57.12% after performing pca and then doing multinomial logistic regression. This performs better than Naive-Bayes. 
+
+#### Model 3 | Support Vector Machine
+
+Let's try to make use of Support Vector Machine (SVM) for multi classification
+```{r}
+svm_model =  svm(y = rep(1:50, each = 50),x = train_transformed, kernel = "sigmoid", type="nu-classification")
+predicted_authors_svm =  as.data.frame(predict(svm_model, newdata=test_transformed, type="nu-classification",s=0)) 
+predicted_authors_svm$actual_authors <- rep(1:50, each = 50)
+colnames(predicted_authors_svm) = c("predicted_authors","actual_authors")
+
+confusionMatrix(predicted_authors_svm$predicted_authors,predicted_authors_logit$actual_authors)
+
+```
+
+
+SVM is giving an accuracy of 55%. 
+
+#### Which authors are hardest to predict? 
+
+From the confusion matrix above, we can see that Author 7 (Darren Schuettler), Author 8 (David Lawder) have a balanced mean accuracy of about 50-60% in the classification models.
+
+Darren Schuettler and david lowder are columnists and contemporary writers and do not have specific set of words that we could associat them with and hence, it really hard to classify their documents into one class as they use varied vocabulary.   
+
+
+#### Conclusion 
+1. We are using three multinomial classification problems to predict the author names. We see that the multinomial logistic regression model is giving us the highest accuracy. 
+2. Based on the high frequency word graph, we see some common mis-spellings. We can maybe treat this in pre-processing in the next run.
+3. We can also think of using advanced models like gbm, nueral nets and lda for this problem
+
+
+## Problem 3 :  Association Rule Mining on Groceries
+
+We'll be using the arules and arulesViz libraries, so make sure they are installed. Read in the transactions and then run apriori on them.
+
+## Parameter Choice
+Why did we choose support of .01 and a confidence of .2? Coming from a business perspective, we want to know how we can improve sales if we know associations between our products. If we choose a support that is too low, we will be making decisions based on product baskets that don't happen often enough to change our marketing strategy to accomodate. If the support is too high, apriori won't return enough rules. We found through trial and error that .01 support hit the sweet spot. We wanted confidence to be low, so that we could get more results and instead judge them by their lift. It can't be too low, otherwise we might not see enough of a return from marketing them together. 
+
+```{r}
+library(arules)  
+library(arulesViz)
+
+foodtrans <- read.transactions("/Users/rakshapai/Downloads/STA380-master/data/groceries.txt", sep = ",")
+
+foodrules <- apriori(foodtrans, parameter=list(support=.01, confidence = .2, maxlen=5))
+plot(foodrules)
+
+```
+As you can see in the plot, most of the high lift rules have quite low wupports and only give a .25 > .4 confidence that the new item will be bought.
+
+
+## Inspecting rules
+
+What we see is that our most impactful rule associations predict mostly vegetables. In the top 15, 11 rules predict vegetables. Most of the vegetables are predicted by different types of vegetables, and fruits. That makes sense. Any competent grocery store already has vegetables and fruits near each other. One of the more interesting rules at the top of lift are beef indicates root vegetables are 3 times more likely to be purchased.
+
+```{r}
+inspect(sort(foodrules, by = "lift")[1:50,])
+
+```
+
+
+
+## Most Common Items
+
+```{r}
+itemFrequencyPlot(foodtrans, topN = 10)
+
+```
+
+
+From the plot we can see the most common items in the transaction list. This will be our baseline when determining how other items affect sales.
+
+
+## Setting up subgroups
+
+```{r}
+andRoot <- subset(foodtrans, items %in% "root vegetables")
+andVeg <- subset(foodtrans, items %in% "other vegetables")
+andSoda <- subset(foodtrans, items %in% "soda")
+
+```
+
+
+
+## Vegetables and Soda's Effect on Other Items
+
+With these graphs we can see what the 10 most common items are given that Root Vegetables, Other Vegetables, or Soda are in the basket. Surprisingly, if people buy soda they are less likely to buy milk, but milk is still the most common thing for them to buy. The lift for soda is also pretty interesting because it shows just what items are really related and not partially related but also popular. Root Vegetables seem to lift up herbs and rice a lot more than the rule associations we saw previously would suggest, and other vegetables life up a significantly different set of products despite being so closely related to each other based on the rules we saw before.
+
+```{r}
+itemFrequencyPlot(andRoot, topN = 11, population = foodtrans, xlab = "Root Vegetables")
+itemFrequencyPlot(andRoot, topN = 11, population = foodtrans, lift = TRUE, xlab = "Root Vegetables")
+itemFrequencyPlot(andVeg, topN = 11, population = foodtrans, xlab = "Other Vegetables")
+itemFrequencyPlot(andVeg, topN = 11, population = foodtrans, lift = TRUE, xlab = "Other Vegetables")
+itemFrequencyPlot(andSoda, topN = 11, population = foodtrans, xlab = "Soda")
+itemFrequencyPlot(andSoda, topN = 11, population = foodtrans, lift = TRUE, xlab = "Soda")
+
+
+```
+
+
+
+
+
+
+.
